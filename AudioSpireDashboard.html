@@ -3417,11 +3417,17 @@ registerProcessor('as-gate-processor', ASGateProcessor);
             if (mixerChannels[channelIndex]._micSource) {
                 try { mixerChannels[channelIndex]._micSource.disconnect(); } catch(_) {}
             }
+            // Cancel any existing watchdog for this channel before starting a new one
+            if (mixerChannels[channelIndex]._micWatchdog) {
+                clearInterval(mixerChannels[channelIndex]._micWatchdog);
+                mixerChannels[channelIndex]._micWatchdog = null;
+            }
 
             const src = audioCtx.createMediaStreamSource(stream);
             src.connect(mixerChannels[channelIndex].in);
             mixerChannels[channelIndex]._micSource = src;
             mixerChannels[channelIndex]._micStream = stream;
+            mixerChannels[channelIndex]._micDeviceId = deviceId; // remembered for auto-reconnect
 
             const btn = document.querySelector(`[data-ch="${channelIndex}"] button`);
             if (btn) {
@@ -3430,9 +3436,101 @@ registerProcessor('as-gate-processor', ASGateProcessor);
                 btn.style.borderColor = '#0f0';
                 btn.title = 'Click to disconnect';
             }
+
+            // ── Track-level event listeners ─────────────────────────────────
+            // Catches OS-level mute/end events. On macOS these fire when CoreAudio
+            // revokes the stream (e.g. exclusive-mode app, permission change).
+            // Drive dismounts usually silently mute without firing onended, which
+            // is why the RMS watchdog below is the primary recovery mechanism.
+            stream.getTracks().forEach(track => {
+                track.onended = () => {
+                    console.warn(`[AudioSpire] CH${channelIndex+1} mic track ended — reconnecting...`);
+                    _reconnectMic(channelIndex, chLabel);
+                };
+                track.onmute = () => {
+                    console.warn(`[AudioSpire] CH${channelIndex+1} mic track muted by OS`);
+                };
+                track.onunmute = () => {
+                    console.log(`[AudioSpire] CH${channelIndex+1} mic track unmuted`);
+                };
+            });
+
+            // ── RMS silence watchdog ────────────────────────────────────────
+            // Polls the mic signal every 500ms via a small AnalyserNode tapped
+            // directly off the MediaStreamSource (before the mixer channel strip).
+            // If RMS stays below 0.0005 for >2.5s while the channel is LIVE,
+            // the stream has silently died — most commonly caused by a CoreAudio
+            // device-graph reset triggered by a drive dismount/remount cycle.
+            // The watchdog cancels itself if the user manually disconnects.
+            const watchAnl = audioCtx.createAnalyser();
+            watchAnl.fftSize = 256;
+            src.connect(watchAnl);
+            const watchBuf = new Float32Array(watchAnl.fftSize);
+            let silentTicks = 0;
+            const SILENT_TICK_LIMIT = 5; // 5 × 500ms = 2.5s of silence → reconnect
+
+            mixerChannels[channelIndex]._micWatchdog = setInterval(() => {
+                // Stop watching if the user has manually disconnected this channel
+                if (!mixerChannels[channelIndex]._micStream) {
+                    clearInterval(mixerChannels[channelIndex]._micWatchdog);
+                    mixerChannels[channelIndex]._micWatchdog = null;
+                    return;
+                }
+                watchAnl.getFloatTimeDomainData(watchBuf);
+                let sum = 0;
+                for (let i = 0; i < watchBuf.length; i++) sum += watchBuf[i] * watchBuf[i];
+                const rms = Math.sqrt(sum / watchBuf.length);
+
+                if (rms < 0.0005) {
+                    silentTicks++;
+                    if (silentTicks >= SILENT_TICK_LIMIT) {
+                        silentTicks = 0;
+                        console.warn(`[AudioSpire] CH${channelIndex+1} mic silent for 2.5s — CoreAudio reset detected, reconnecting...`);
+                        _reconnectMic(channelIndex, chLabel);
+                    }
+                } else {
+                    silentTicks = 0; // reset counter on any real signal
+                }
+            }, 500);
+
         } catch(e) {
             console.warn(`[AudioSpire] ${chLabel} connection failed:`, e.message);
         }
+    }
+
+    // ── MIC AUTO-RECONNECT ────────────────────────────────────────────────────
+    // Called by both the track.onended listener and the RMS silence watchdog.
+    // Tears down the dead stream cleanly, waits 1.2s for CoreAudio to settle
+    // after a device-graph change, then re-runs the full connectMicDevice flow
+    // (which re-attaches the watchdog automatically).
+    async function _reconnectMic(channelIndex, chLabel) {
+        const deviceId = mixerChannels[channelIndex]._micDeviceId;
+        if (!deviceId) return; // nothing to reconnect to
+
+        // Stop the watchdog so it doesn't fire again mid-reconnect
+        if (mixerChannels[channelIndex]._micWatchdog) {
+            clearInterval(mixerChannels[channelIndex]._micWatchdog);
+            mixerChannels[channelIndex]._micWatchdog = null;
+        }
+        // Stop all tracks on the dead stream
+        if (mixerChannels[channelIndex]._micStream) {
+            try { mixerChannels[channelIndex]._micStream.getTracks().forEach(t => t.stop()); } catch(_) {}
+            mixerChannels[channelIndex]._micStream = null;
+        }
+        // Disconnect the dead source node from the audio graph
+        if (mixerChannels[channelIndex]._micSource) {
+            try { mixerChannels[channelIndex]._micSource.disconnect(); } catch(_) {}
+            mixerChannels[channelIndex]._micSource = null;
+        }
+
+        // Give CoreAudio 1.2s to finish its device-graph rescan after the
+        // drive remount before we attempt to reacquire the mic stream.
+        await new Promise(r => setTimeout(r, 1200));
+
+        // Re-run the full connection flow — this also re-attaches the watchdog.
+        console.log(`[AudioSpire] CH${channelIndex+1} mic reconnecting to device ${deviceId}...`);
+        await connectMicDevice(channelIndex, deviceId, chLabel);
+        console.log(`[AudioSpire] CH${channelIndex+1} mic reconnected ✓`);
     }
 
     function buildMixerUI() {
